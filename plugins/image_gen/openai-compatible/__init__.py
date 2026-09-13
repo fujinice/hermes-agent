@@ -10,8 +10,9 @@ from __future__ import annotations
 
 import json
 import logging
-import os
+import math
 from typing import Any, Dict, Iterable, List, Optional
+from urllib.parse import urlsplit
 
 import requests
 
@@ -24,6 +25,7 @@ from agent.image_gen_provider import (
     save_url_image,
     success_response,
 )
+from agent.secret_scope import get_secret
 
 logger = logging.getLogger(__name__)
 
@@ -55,14 +57,13 @@ def _load_config() -> Dict[str, Any]:
 
 
 def _cfg_value(name: str, default: Optional[str] = None) -> Optional[str]:
-    env_name = f"{ENV_PREFIX}_{name.upper()}"
-    env_value = os.getenv(env_name)
-    if env_value is not None and env_value.strip():
-        return env_value.strip()
-
     value = _load_config().get(name)
     if isinstance(value, str) and value.strip():
         return value.strip()
+    # Retain the original env settings as profile-scoped compatibility fallbacks.
+    env_value = get_secret(f"{ENV_PREFIX}_{name.upper()}")
+    if env_value is not None and env_value.strip():
+        return env_value.strip()
     return default
 
 
@@ -81,9 +82,26 @@ def _top_level_image_model() -> Optional[str]:
 
 
 def _resolve_model(override: Optional[str] = None) -> str:
+    configured = _cfg_value("model")
+    if configured:
+        return configured
     if isinstance(override, str) and override.strip():
         return override.strip()
-    return _cfg_value("model") or _top_level_image_model() or DEFAULT_MODEL
+    return _top_level_image_model() or DEFAULT_MODEL
+
+
+def _endpoint(base_url: str) -> str:
+    value = base_url.strip().rstrip("/")
+    parsed = urlsplit(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("base_url must be an absolute HTTP(S) API root")
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ValueError("base_url must not contain credentials, a query, or a fragment")
+    if parsed.path.endswith("/images/generations"):
+        return value
+    if not parsed.path:
+        value += "/v1"
+    return value + "/images/generations"
 
 
 def _has_image_data(payload: Dict[str, Any]) -> bool:
@@ -109,60 +127,66 @@ def _as_done_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     return payload
 
 
+def _sse_events(lines: Iterable[str]) -> Iterable[tuple[str, str]]:
+    event = ""
+    data: List[str] = []
+    for raw_line in lines:
+        line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else raw_line
+        if not line:
+            if data:
+                yield event, "\n".join(data)
+            event, data = "", []
+            continue
+        if line.startswith(":"):
+            continue
+        field, _, value = line.partition(":")
+        if value.startswith(" "):
+            value = value[1:]
+        if field == "event":
+            event = value
+        elif field == "data":
+            data.append(value)
+    # Some image gateways close immediately after their final data line.
+    if data:
+        yield event, "\n".join(data)
+
+
 def _parse_sse_lines(lines: Iterable[str]) -> Dict[str, Any]:
-    current_event: Optional[str] = None
     preferred_payload: Optional[Dict[str, Any]] = None
     image_payload: Optional[Dict[str, Any]] = None
-    partial_payload: Optional[Dict[str, Any]] = None
-    last_payload: Optional[Dict[str, Any]] = None
-
-    for raw_line in lines:
-        if isinstance(raw_line, bytes):
-            line = raw_line.decode("utf-8", errors="replace")
-        else:
-            line = str(raw_line)
-        line = line.strip()
-        if not line or line.startswith(":"):
-            continue
-        if line.startswith("event:"):
-            current_event = line[6:].strip()
-            continue
-        if not line.startswith("data:"):
-            continue
-
-        data = line[5:].strip()
-        if data == "[DONE]":
-            continue
-        try:
-            payload = json.loads(data)
-        except json.JSONDecodeError:
-            logger.debug("Skipping non-JSON SSE image payload: %s", data[:200])
-            continue
+    for event, data in _sse_events(lines):
+        if data.strip() == "[DONE]":
+            break
+        payload = json.loads(data)
+        if event == "error":
+            message = payload
+            if isinstance(payload, dict):
+                message = payload.get("message") or payload.get("error") or payload
+            raise ValueError(f"Image generation provider error: {message}")
         if not isinstance(payload, dict):
             continue
-
-        if current_event == "error":
-            message = payload.get("message") or payload.get("error") or payload
-            raise ValueError(f"Image generation provider error: {message}")
-
-        last_payload = payload
+        if payload.get("error"):
+            raise ValueError(f"Image generation provider error: {payload['error']}")
+        # A preview never becomes a final result merely because the stream ends.
+        if event == "partial_image":
+            continue
         normalized = _as_done_payload(payload)
-        if current_event == "done":
+        if not _has_image_data(normalized):
+            continue
+        if event == "done":
             preferred_payload = normalized
-        elif _has_image_data(normalized):
+        else:
             image_payload = normalized
-        elif current_event == "partial_image":
-            partial_payload = normalized
-
-    result = preferred_payload or image_payload or partial_payload or last_payload
+    result = preferred_payload or image_payload
     if result is None:
-        raise ValueError("No JSON payload found in image generation SSE response")
+        raise ValueError("No final image found in image generation SSE response")
     return result
 
 
 def _response_json(response: requests.Response) -> Dict[str, Any]:
     content_type = response.headers.get("content-type", "").lower()
     if "text/event-stream" in content_type:
+        response.encoding = "utf-8"
         return _parse_sse_lines(response.iter_lines(decode_unicode=True))
 
     try:
@@ -184,14 +208,18 @@ class OpenAICompatibleImageGenProvider(ImageGenProvider):
         return "OpenAI-compatible Images"
 
     def is_available(self) -> bool:
-        return bool(_cfg_value("base_url"))
+        try:
+            _endpoint(_cfg_value("base_url") or "")
+        except (ValueError, RuntimeError):
+            return False
+        return not bool(_load_config().get("api_key"))
 
     def list_models(self) -> List[Dict[str, Any]]:
         model = _resolve_model()
         return [
             {
                 "id": model,
-                "name": model,
+                "display": model,
                 "description": "Configured OpenAI-compatible image generation model",
                 "strengths": "OpenAI-compatible /v1/images/generations endpoint",
             }
@@ -199,13 +227,9 @@ class OpenAICompatibleImageGenProvider(ImageGenProvider):
 
     def get_setup_schema(self) -> Dict[str, Any]:
         return {
+            "name": self.display_name,
             "tag": "OpenAI-compatible /v1/images/generations endpoint — JSON & SSE",
             "env_vars": [
-                {
-                    "key": f"{ENV_PREFIX}_BASE_URL",
-                    "prompt": "Base URL (e.g. http://localhost:8000/v1)",
-                    "url": "",
-                },
                 {
                     "key": f"{ENV_PREFIX}_API_KEY",
                     "prompt": "API key (optional)",
@@ -214,12 +238,32 @@ class OpenAICompatibleImageGenProvider(ImageGenProvider):
             ],
         }
 
+    def capabilities(self) -> Dict[str, Any]:
+        return {"modalities": ["text"], "max_reference_images": 0}
+
     def generate(
         self,
         prompt: str,
         aspect_ratio: str = DEFAULT_ASPECT_RATIO,
+        *,
+        image_url: Optional[str] = None,
+        reference_image_urls: Optional[List[str]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
+        if image_url or reference_image_urls:
+            return error_response(
+                error="OpenAI-compatible Images supports text-to-image only",
+                error_type="modality_unsupported", provider=self.name,
+                prompt=prompt, aspect_ratio=aspect_ratio,
+            )
+        if not isinstance(prompt, str) or not prompt.strip():
+            return error_response(error="Prompt must be a non-empty string", error_type="invalid_argument", provider=self.name)
+        config = _load_config()
+        if config.get("api_key"):
+            return error_response(
+                error=f"Move image_gen.openai_compatible.api_key to the {ENV_PREFIX}_API_KEY secret",
+                error_type="invalid_config", provider=self.name,
+            )
         base_url = (_cfg_value("base_url") or "").rstrip("/")
         model = _resolve_model(kwargs.get("model"))
         if not base_url:
@@ -231,6 +275,14 @@ class OpenAICompatibleImageGenProvider(ImageGenProvider):
                 prompt=prompt,
                 aspect_ratio=aspect_ratio,
             )
+
+        try:
+            endpoint = _endpoint(base_url)
+            timeout = float(config.get("timeout", 120.0))
+            if not math.isfinite(timeout) or timeout <= 0:
+                raise ValueError("timeout must be a finite positive number")
+        except (TypeError, ValueError) as exc:
+            return error_response(error=str(exc), error_type="invalid_config", provider=self.name)
 
         payload: Dict[str, Any] = {
             "model": model,
@@ -247,19 +299,23 @@ class OpenAICompatibleImageGenProvider(ImageGenProvider):
             "Content-Type": "application/json",
             "Accept": "text/event-stream, application/json",
         }
-        api_key = _cfg_value("api_key")
+        api_key = (get_secret(f"{ENV_PREFIX}_API_KEY") or "").strip()
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
 
         try:
-            response = requests.post(
-                f"{base_url}/images/generations",
+            with requests.post(
+                endpoint,
                 json=payload,
                 headers=headers,
-                timeout=float(kwargs.get("timeout") or 120.0),
-            )
-            response.raise_for_status()
-            data = _response_json(response)
+                timeout=timeout,
+                stream=True,
+                allow_redirects=False,
+            ) as response:
+                if 300 <= response.status_code < 400:
+                    raise ValueError("Image endpoint redirected; configure the final API root explicitly")
+                response.raise_for_status()
+                data = _response_json(response)
         except Exception as exc:
             return error_response(
                 error=str(exc),
